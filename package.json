@@ -1,14 +1,14 @@
 {
   "name": "shopify-appointments-server",
   "version": "1.0.0",
-  "description": "Express server to create Appointment metaobjects in Shopify",
+  "description": "Express server for creating Shopify Appointment metaobjects with OAuth",
   "type": "module",
   "engines": { "node": ">=18" },
-  "scripts": {
-    "start": "node server.js"
-  },
+  "scripts": { "start": "node server.js" },
   "dependencies": {
     "cors": "^2.8.5",
-    "express": "^4.19.2"
+    "express": "^4.19.4",
+    "cookie-parser": "^1.4.6",
+    "uuid": "^9.0.0"
   }
 }
