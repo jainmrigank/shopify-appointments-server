@@ -3,6 +3,7 @@
  * - OAuth install flow for Shopify apps (express)
  * - Stores per-shop access tokens in tokens.json (simple file store for dev)
  * - Exposes POST /appointments which uses the shop's access token to create a metaobject
+ * - Exposes GET /appointments/availability to fetch existing bookings
  *
  * WARNING: tokens.json is a simple file store for development. Use a proper DB in production.
  */
@@ -183,6 +184,101 @@ app.post("/webhooks/app/uninstalled", async (req, res) => {
     await writeTokens(tokens);
   }
   res.sendStatus(200);
+});
+
+/**
+ * Get Appointment Availability
+ * GET /appointments/availability?shop=your-store.myshopify.com
+ * Returns: { bookings: [{ date: 'YYYY-MM-DD', time: 'HH:MM' }, ...] }
+ */
+app.get("/appointments/availability", async (req, res) => {
+  try {
+    const shop = req.query.shop || req.headers["x-shopify-shop-domain"] || SHOPIFY_STORE_DOMAIN;
+    
+    if (!shop) {
+      return res.status(400).json({ ok: false, error: "Shop domain missing. Provide 'shop' query parameter." });
+    }
+
+    // Try per-shop token
+    const tokens = await readTokens();
+    let accessToken = tokens[shop]?.access_token || null;
+
+    // fallback to global admin token
+    if (!accessToken && SHOPIFY_ADMIN_API_TOKEN && SHOPIFY_STORE_DOMAIN && SHOPIFY_STORE_DOMAIN === shop) {
+      accessToken = SHOPIFY_ADMIN_API_TOKEN;
+    }
+    
+    if (!accessToken) {
+      return res.status(403).json({ ok: false, error: "No access token for this shop." });
+    }
+
+    // Query to fetch all appointments
+    const query = `
+      query GetAppointments {
+        metaobjects(type: "appointment", first: 250) {
+          edges {
+            node {
+              id
+              fields {
+                key
+                value
+              }
+            }
+          }
+        }
+      }`;
+
+    const graphRes = await fetch(`https://${shop}/admin/api/${API_VERSION}/graphql.json`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Shopify-Access-Token": accessToken
+      },
+      body: JSON.stringify({ query })
+    });
+
+    const graphData = await graphRes.json();
+    
+    if (graphData.errors) {
+      console.error("GraphQL errors:", graphData.errors);
+      return res.status(500).json({ ok: false, error: graphData.errors });
+    }
+
+    // Parse appointments and extract date/time
+    const bookings = [];
+    const edges = graphData.data?.metaobjects?.edges || [];
+    
+    for (const edge of edges) {
+      const fields = edge.node.fields || [];
+      const fieldsObj = {};
+      
+      // Convert fields array to object
+      fields.forEach(f => {
+        fieldsObj[f.key] = f.value;
+      });
+
+      // Extract datetime and parse it
+      const datetime = fieldsObj.datetime;
+      if (datetime) {
+        try {
+          const dt = new Date(datetime);
+          const date = dt.toISOString().split('T')[0]; // YYYY-MM-DD
+          const hours = String(dt.getHours()).padStart(2, '0');
+          const minutes = String(dt.getMinutes()).padStart(2, '0');
+          const time = `${hours}:${minutes}`; // HH:MM in 24-hour format
+          
+          bookings.push({ date, time });
+        } catch (err) {
+          console.error('Failed to parse datetime:', datetime, err);
+        }
+      }
+    }
+
+    return res.json({ ok: true, bookings });
+  } catch (err) {
+    console.error("Server error:", err);
+    return res.status(500).json({ ok: false, error: "Server error" });
+  }
 });
 
 /**
