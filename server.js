@@ -170,6 +170,7 @@ async function getTokenForShop(shop) {
 // ---- Availability: returns booked slots ----
 app.get("/appointments/availability", async (req, res) => {
   try {
+    res.set("Cache-Control","no-store"); // NEW: prevent 304s to clients
     const shop = normalizeShop(req, req.query.shop);
     if (!shop) return res.status(400).json({ ok: false, error: "Shop domain missing." });
 
@@ -252,36 +253,50 @@ app.post("/appointments", async (req, res) => {
     });
 
     // Build fields for the "appointment" metaobject definition
-    const fields = [
-      { key: "customer_name", value: name.trim() },
-      { key: "email", value: email.trim() },
-      { key: "contact_number", value: phone.trim() },
-      { key: "datetime", value: datetimeISO },
-      { key: "notes", value: notes.trim() },
-      { key: "status", value: "new" }
-    ];
-    if (productGids.length) {
-      // IMPORTANT: list of product references uses 'references' with IDs
-      fields.push({ key: "products", references: productGids });
+const fieldsBase = [
+  { key: "customer_name", value: name.trim() },
+  { key: "email", value: email.trim() },
+  { key: "contact_number", value: phone.trim() },
+  { key: "datetime", value: datetimeISO },
+  { key: "notes", value: notes.trim() },
+  { key: "status", value: "new" }
+];
+
+// Prepare references if products exist
+const productGids = (Array.isArray(products) ? products : [])
+  .map(p => String(p).startsWith("gid://") ? String(p) : `gid://shopify/Product/${p}`);
+
+// First attempt: use references (List<Product> field)
+let fields = [...fieldsBase];
+if (productGids.length) fields.push({ key: "products", references: productGids });
+
+const mutation = `
+  mutation CreateAppointment($metaobject: MetaobjectCreateInput!) {
+    metaobjectCreate(metaobject: $metaobject) {
+      metaobject { id }
+      userErrors { field message code }
     }
+  }`;
 
-    const mutation = `
-      mutation CreateAppointment($metaobject: MetaobjectCreateInput!) {
-        metaobjectCreate(metaobject: $metaobject) {
-          metaobject { id }
-          userErrors { field message code }
-        }
-      }
-    `;
-    const variables = { metaobject: { type: "appointment", fields } };
-    const create = await adminFetch(shop, accessToken, mutation, variables);
+let variables = { metaobject: { type: "appointment", fields } };
+let create = await adminFetch(shop, accessToken, mutation, variables);
+let userErrors = create.json?.data?.metaobjectCreate?.userErrors || [];
 
-    const userErrors = create.json?.data?.metaobjectCreate?.userErrors || [];
-    if (!create.ok || (userErrors && userErrors.length)) {
-      return res.status(500).json({ ok: false, error: userErrors.length ? userErrors : create.json?.errors || "Unknown error" });
-    }
+// Fallback: if references are rejected, store IDs as text JSON
+if (userErrors.length && productGids.length) {
+  const looksLikeRefError = userErrors.some(e => (e.field || []).join('.').includes('products') || /reference/i.test(e.message));
+  if (looksLikeRefError) {
+    fields = [...fieldsBase, { key: "products", value: JSON.stringify(productGids) }];
+    variables = { metaobject: { type: "appointment", fields } };
+    create = await adminFetch(shop, accessToken, mutation, variables);
+    userErrors = create.json?.data?.metaobjectCreate?.userErrors || [];
+  }
+}
 
-    return res.json({ ok: true });
+if (userErrors.length) {
+  return res.status(500).json({ ok: false, error: userErrors });
+}
+return res.json({ ok: true });
   } catch (err) {
     console.error("create error", err);
     return res.status(500).json({ ok: false, error: "Server error" });
