@@ -21,9 +21,9 @@ const {
   SHOPIFY_API_KEY,
   SHOPIFY_API_SECRET,
   HOST,
-  SCOPES,,
+  SCOPES,
   API_VERSION,
-  SHOPIFY_ADMIN_API_TOKEN,
+  SHOPIFY_ADMIN_API_TOKEN="bc5864dc81d62fc75762200a46e261d3",
   SHOPIFY_STORE_DOMAIN="1ug0pd-tj.myshopify.com",
   // Comma-separated list of allowed origins, e.g. https://somarra.in,https://www.somarra.in,https://<store>.myshopify.com
   ALLOWED_ORIGINS
