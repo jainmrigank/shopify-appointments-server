@@ -21,12 +21,12 @@ const {
   SHOPIFY_API_KEY,
   SHOPIFY_API_SECRET,
   HOST,
-  SCOPES = "write_metaobjects,read_metaobjects,read_products,read_customers",
-  API_VERSION = "2025-10",
+  SCOPES,,
+  API_VERSION,
   SHOPIFY_ADMIN_API_TOKEN,
-  SHOPIFY_STORE_DOMAIN,
+  SHOPIFY_STORE_DOMAIN="1ug0pd-tj.myshopify.com",
   // Comma-separated list of allowed origins, e.g. https://somarra.in,https://www.somarra.in,https://<store>.myshopify.com
-  ALLOWED_ORIGINS = ""
+  ALLOWED_ORIGINS
 } = process.env;
 
 // ---- token store (dev) ----
