@@ -1,311 +1,354 @@
-/**
- * server.js (updated)
- * - Supports App Proxy or direct calls from the storefront
- * - Availability + booking for "appointment" metaobject
- */
+require('dotenv').config();
+const express = require('express');
+const crypto = require('crypto');
+const fetch = require('node-fetch');
+const fs = require('fs');
+const path = require('path');
 
-import express from "express";
-import cors from "cors";
-import cookieParser from "cookie-parser";
-import crypto from "crypto";
-import fs from "fs/promises";
-import path from "path";
-import { v4 as uuidv4 } from "uuid";
-
-const app = express();
-app.use(express.json({ limit: "1mb" }));
+const cookieParser = require('cookie-parser');
 app.use(cookieParser());
 
-// ---- CONFIG ----
-const {
-  SHOPIFY_API_KEY,
-  SHOPIFY_API_SECRET,
-  HOST,
-  SCOPES,
-  API_VERSION,
-  SHOPIFY_ADMIN_API_TOKEN="bc5864dc81d62fc75762200a46e261d3",
-  SHOPIFY_STORE_DOMAIN="1ug0pd-tj.myshopify.com",
-  // Comma-separated list of allowed origins, e.g. https://somarra.in,https://www.somarra.in,https://<store>.myshopify.com
-  ALLOWED_ORIGINS
-} = process.env;
+const app = express();
+app.use(express.json());
 
-// ---- token store (dev) ----
-const TOKENS_PATH = path.resolve("./tokens.json");
-async function readTokens() {
-  try {
-    const raw = await fs.readFile(TOKENS_PATH, "utf8");
-    return JSON.parse(raw || "{}");
-  } catch {
-    return {};
-  }
+// Environment variables
+const API_KEY = process.env.SHOPIFY_API_KEY;
+const API_SECRET = process.env.SHOPIFY_API_SECRET;
+const SCOPES = process.env.SCOPES || 'write_customers,read_customers,write_metaobjects,read_metaobjects,read_products';
+const HOST = process.env.HOST || 'https://shopify-appointments-server.onrender.com';
+const API_VERSION = process.env.API_VERSION || '2025-10';
+
+// Simple file-based token storage
+const TOKENS_FILE = path.join(__dirname, 'tokens.json');
+function readTokens() {
+  if (!fs.existsSync(TOKENS_FILE)) return {};
+  return JSON.parse(fs.readFileSync(TOKENS_FILE, 'utf8'));
 }
-async function writeTokens(json) {
-  await fs.writeFile(TOKENS_PATH, JSON.stringify(json, null, 2));
+function writeTokens(tokens) {
+  fs.writeFileSync(TOKENS_FILE, JSON.stringify(tokens, null, 2));
 }
 
-// ---- helper: install URL ----
-function buildInstallUrl(shop, state) {
-  const redirect = encodeURIComponent(`${HOST?.replace(/\/$/, "")}/auth/callback`);
-  return `https://${shop}/admin/oauth/authorize?client_id=${SHOPIFY_API_KEY}&scope=${encodeURIComponent(SCOPES)}&redirect_uri=${redirect}&state=${state}`;
+// Normalize shop domain
+function normalizeShop(req, fallback = '') {
+  return (req.query.shop || req.body?.shop || fallback || '').replace(/^https?:\/\//, '').replace(/\/$/, '');
 }
 
-// ---- helper: verify HMAC ----
-function verifyHmac(query, secret) {
-  const { hmac, signature, ...rest } = query;
-  const sorted = Object.keys(rest)
-    .filter((k) => k !== "signature" && k !== "hmac")
-    .sort()
-    .map((k) => `${k}=${rest[k]}`)
-    .join("&");
-  const digest = crypto.createHmac("sha256", secret).update(sorted).digest("hex");
-  return digest === hmac;
-}
-
-// ---- state ----
-const STATE_MAP = new Map();
-
-// CORS
-const allowList = (process.env.ALLOWED_ORIGINS || '')
+// CORS Configuration
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || '')
   .split(',')
   .map(s => s.trim())
   .filter(Boolean);
 
-const isAllowedOrigin = (origin) => {
-  if (!origin) return true;
-  try {
-    const u = new URL(origin);
-    return allowList.includes(origin) || u.hostname.endsWith('.myshopify.com');
-  } catch { return false; }
-};
-
 app.use((req, res, next) => {
   const origin = req.headers.origin;
-  if (isAllowedOrigin(origin)) {
+  const isAllowed = !origin || 
+    allowedOrigins.includes(origin) || 
+    (origin && new URL(origin).hostname.endsWith('.myshopify.com'));
+  
+  if (isAllowed) {
     res.header('Access-Control-Allow-Origin', origin || '*');
-    res.header('Vary', 'Origin');
     res.header('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
-    // Allow the headers your browser is sending (include cache-control to satisfy preflight)
-    res.header('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-Shopify-Shop-Domain,Cache-Control');
-    // Optional: expose any custom headers you return
+    res.header('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-Shopify-Shop-Domain');
     res.header('Access-Control-Expose-Headers', 'Content-Type');
   }
+  
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
 
-// ---- ROUTES ----
-
-app.get("/", (_req, res) => res.send("OK"));
-
-// OAuth start
-app.get("/auth", async (req, res) => {
-  const shop = req.query.shop;
-  if (!shop) return res.status(400).send("Missing shop param. Usage: /auth?shop=store.myshopify.com");
-  const state = uuidv4();
-  STATE_MAP.set(state, shop);
-  res.redirect(buildInstallUrl(shop, state));
-});
-
-// OAuth callback
-app.get("/auth/callback", async (req, res) => {
-  const { shop, code, state } = req.query;
-  if (!shop || !code || !state) return res.status(400).send("Missing required params (shop, code, state).");
-  if (STATE_MAP.get(state) !== shop) return res.status(403).send("Invalid state.");
-  if (!verifyHmac(req.query, SHOPIFY_API_SECRET)) return res.status(400).send("HMAC validation failed.");
-
-  try {
-    const tokenRes = await fetch(`https://${shop}/admin/oauth/access_token`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ client_id: SHOPIFY_API_KEY, client_secret: SHOPIFY_API_SECRET, code })
-    });
-    const tokenJson = await tokenRes.json();
-    if (!tokenRes.ok) return res.status(500).send("Failed to get access token.");
-
-    const tokens = await readTokens();
-    tokens[shop] = { access_token: tokenJson.access_token, scope: tokenJson.scope, installed_at: new Date().toISOString() };
-    await writeTokens(tokens);
-    STATE_MAP.delete(state);
-    return res.redirect(HOST || "/");
-  } catch (err) {
-    console.error(err);
-    return res.status(500).send("Error during OAuth callback.");
-  }
-});
-
-// App uninstall webhook
-app.post("/webhooks/app/uninstalled", async (req, res) => {
-  const shop = req.headers["x-shopify-shop-domain"];
-  if (shop) {
-    const tokens = await readTokens();
-    delete tokens[shop];
-    await writeTokens(tokens);
-  }
-  res.sendStatus(200);
-});
-
-// ---- Helpers ----
-function normalizeShop(req, bodyShop) {
-  return bodyShop || req.headers["x-shopify-shop-domain"] || SHOPIFY_STORE_DOMAIN;
+// HMAC Verification
+function verifyHmac(query, hmac) {
+  const message = Object.keys(query)
+    .filter(key => key !== 'hmac' && key !== 'signature')
+    .sort()
+    .map(key => `${key}=${query[key]}`)
+    .join('&');
+  
+  const hash = crypto
+    .createHmac('sha256', API_SECRET)
+    .update(message)
+    .digest('hex');
+  
+  return hash === hmac;
 }
 
-async function adminFetch(shop, accessToken, query, variables = {}) {
-  const res = await fetch(`https://${shop}/admin/api/${API_VERSION}/graphql.json`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Shopify-Access-Token": accessToken
-    },
-    body: JSON.stringify({ query, variables })
+// Generate nonce
+function generateNonce() {
+  return crypto.randomBytes(16).toString('hex');
+}
+
+// ============ OAUTH ROUTES ============
+
+// Step 1: Install initiation (redirect to Shopify auth)
+app.get('/auth', (req, res) => {
+  const shop = normalizeShop(req);
+  
+  if (!shop || !/^[a-zA-Z0-9][a-zA-Z0-9\-]*\.myshopify\.com$/.test(shop)) {
+    return res.status(400).send('Invalid shop parameter');
+  }
+
+  const nonce = generateNonce();
+  const redirectUri = `${HOST}/auth/callback`;
+  const installUrl = `https://${shop}/admin/oauth/authorize?` +
+    `client_id=${API_KEY}&` +
+    `scope=${SCOPES}&` +
+    `redirect_uri=${encodeURIComponent(redirectUri)}&` +
+    `state=${nonce}`;
+
+  // Store nonce in cookie for verification
+  res.cookie('shopify_nonce', nonce, {
+    httpOnly: true,
+    secure: true,
+    sameSite: 'none',
+    maxAge: 600000 // 10 minutes
   });
-  const json = await res.json();
-  return { ok: res.ok, json };
-}
 
-async function getTokenForShop(shop) {
-  const tokens = await readTokens();
-  let accessToken = tokens[shop]?.access_token || null;
-  if (!accessToken && SHOPIFY_ADMIN_API_TOKEN && SHOPIFY_STORE_DOMAIN === shop) {
-    accessToken = SHOPIFY_ADMIN_API_TOKEN;
+  res.redirect(installUrl);
+});
+
+// Step 2: OAuth callback (exchange code for token)
+app.get('/auth/callback', async (req, res) => {
+  const { code, hmac, shop, state } = req.query;
+  
+  // Security checks
+  if (!verifyHmac(req.query, hmac)) {
+    return res.status(403).send('HMAC verification failed');
   }
-  return accessToken;
-}
 
-// ---- Availability: returns booked slots ----
-app.get("/appointments/availability", async (req, res) => {
+  const nonce = req.cookies?.shopify_nonce;
+  if (state !== nonce) {
+    return res.status(403).send('State verification failed');
+  }
+
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9\-]*\.myshopify\.com$/.test(shop)) {
+    return res.status(400).send('Invalid shop');
+  }
+
+  // Exchange code for access token
   try {
-    res.set("Cache-Control","no-store"); // NEW: prevent 304s to clients
-    const shop = normalizeShop(req, req.query.shop);
-    if (!shop) return res.status(400).json({ ok: false, error: "Shop domain missing." });
+    const tokenUrl = `https://${shop}/admin/oauth/access_token`;
+    const payload = {
+      client_id: API_KEY,
+      client_secret: API_SECRET,
+      code
+    };
 
-    const accessToken = await getTokenForShop(shop);
-    if (!accessToken) return res.status(403).json({ ok: false, error: "No access token for this shop." });
+    const response = await fetch(tokenUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
 
-    const query = `
-      query GetAppointments {
-        metaobjects(type: "appointment", first: 250) {
-          edges {
-            node {
-              id
-              fields { key value }
+    const data = await response.json();
+
+    if (!response.ok || !data.access_token) {
+      console.error('Token exchange failed:', data);
+      return res.status(500).send('Failed to get access token');
+    }
+
+    // Store token
+    const tokens = readTokens();
+    tokens[shop] = {
+      accessToken: data.access_token,
+      scope: data.scope,
+      createdAt: new Date().toISOString()
+    };
+    writeTokens(tokens);
+
+    console.log(`✅ Access token acquired for ${shop}`);
+
+    // Redirect to your app
+    res.send(`
+      <html>
+        <head><title>Installation Complete</title></head>
+        <body>
+          <h2>App installed successfully!</h2>
+          <p>You can now close this window and refresh your store admin.</p>
+          <script>
+            setTimeout(() => {
+              window.location.href = 'https://${shop}/admin/apps';
+            }, 2000);
+          </script>
+        </body>
+      </html>
+    `);
+
+  } catch (error) {
+    console.error('OAuth callback error:', error);
+    res.status(500).send('OAuth error');
+  }
+});
+
+// ============ API ROUTES ============
+
+// Get availability
+app.get('/appointments/availability', async (req, res) => {
+  try {
+    res.set('Cache-Control', 'no-store');
+    
+    const shop = normalizeShop(req);
+    const tokens = readTokens();
+    const token = tokens[shop]?.accessToken;
+
+    if (!token) {
+      return res.status(403).json({
+        ok: false,
+        error: 'No access token. Please install the app first.',
+        installUrl: `${HOST}/auth?shop=${shop}`
+      });
+    }
+
+    // Query metaobjects for appointments
+    const query = `{
+      metaobjects(first: 250, type: "appointment") {
+        edges {
+          node {
+            fields {
+              key
+              value
             }
           }
         }
       }
-    `;
-    const { json } = await adminFetch(shop, accessToken, query);
+    }`;
 
-    if (json.errors) return res.status(500).json({ ok: false, error: json.errors });
+    const apiUrl = `https://${shop}/admin/api/${API_VERSION}/graphql.json`;
+    const response = await fetch(apiUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Shopify-Access-Token': token
+      },
+      body: JSON.stringify({ query })
+    });
 
-    const bookings = [];
-    const edges = json.data?.metaobjects?.edges || [];
-    for (const edge of edges) {
-      const map = Object.fromEntries((edge.node.fields || []).map(f => [f.key, f.value]));
-      if (map.datetime) {
-        const dt = new Date(map.datetime);
-        const date = dt.toISOString().slice(0,10);
-        const time = dt.toISOString().slice(11,16);
-        bookings.push({ date, time });
-      }
+    const data = await response.json();
+
+    if (data.errors) {
+      console.error('GraphQL errors:', data.errors);
+      return res.status(500).json({ ok: false, error: 'GraphQL query failed' });
     }
-    return res.json({ ok: true, bookings });
-  } catch (err) {
-    console.error("availability error", err);
-    return res.status(500).json({ ok: false, error: "Server error" });
+
+    // Parse bookings
+    const bookings = [];
+    const edges = data.data?.metaobjects?.edges || [];
+
+    edges.forEach(edge => {
+      const fields = edge.node.fields || [];
+      const fieldMap = {};
+      fields.forEach(f => { fieldMap[f.key] = f.value; });
+
+      if (fieldMap.datetime) {
+        const dt = new Date(fieldMap.datetime);
+        bookings.push({
+          date: dt.toISOString().slice(0, 10),
+          time: dt.toISOString().slice(11, 16)
+        });
+      }
+    });
+
+    res.json({ ok: true, bookings });
+
+  } catch (error) {
+    console.error('Availability error:', error);
+    res.status(500).json({ ok: false, error: 'Server error' });
   }
 });
 
-// ---- Create appointment ----
-app.post("/appointments", async (req, res) => {
+// Create appointment
+app.post('/appointments', async (req, res) => {
   try {
-    const { name, email, phone, date, time, notes = "", products = [], shop: bodyShop } = req.body || {};
-    const errors = {};
-    if (!name?.trim()) errors.name = "Please enter your name";
-    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) errors.email = "Enter a valid email";
-    if (!phone?.trim()) errors.phone = "Please enter your contact number";
-    if (!date) errors.date = "Pick a date";
-    if (!time) errors.time = "Pick a time";
-    if (Object.keys(errors).length) return res.status(422).json({ ok: false, errors });
+    const { name, email, phone, date, time, notes, products, shop: reqShop } = req.body;
+    const shop = normalizeShop(req, reqShop);
+    
+    const tokens = readTokens();
+    const token = tokens[shop]?.accessToken;
 
-    const shop = normalizeShop(req, bodyShop);
-    if (!shop) return res.status(400).json({ ok: false, error: "Shop domain missing." });
-
-    const accessToken = await getTokenForShop(shop);
-    if (!accessToken) return res.status(403).json({ ok: false, error: "No access token for this shop." });
-
-    // Build ISO datetime from local date + time (treat as local time)
-    const datetimeISO = new Date(`${date}T${time}`).toISOString();
-
-    // Prevent double-booking: check if an appointment exists for the same datetime
-    const checkQuery = `
-      query GetAppointments {
-        metaobjects(type: "appointment", first: 250) { edges { node { fields { key value } } } }
-      }
-    `;
-    const check = await adminFetch(shop, accessToken, checkQuery);
-    const edges = check.json?.data?.metaobjects?.edges || [];
-    const isTaken = edges.some(edge => {
-      const map = Object.fromEntries((edge.node.fields || []).map(f => [f.key, f.value]));
-      return map.datetime && new Date(map.datetime).toISOString() === datetimeISO;
-    });
-    if (isTaken) return res.status(409).json({ ok: false, errors: { time: "This time slot is already booked" } });
-
-    // Convert product ids to GIDs
-    /* const productGids = (Array.isArray(products) ? products : []).map(p => {
-      const s = String(p);
-      return s.startsWith("gid://") ? s : `gid://shopify/Product/${s}`;
-    }); */
-
-    // Build fields for the "appointment" metaobject definition
-const fieldsBase = [
-  { key: "customer_name", value: name.trim() },
-  { key: "email", value: email.trim() },
-  { key: "contact_number", value: phone.trim() },
-  { key: "datetime", value: datetimeISO },
-  { key: "notes", value: notes.trim() },
-  { key: "status", value: "new" }
-];
-
-// Prepare references if products exist
-const productGids = (Array.isArray(products) ? products : [])
-  .map(p => String(p).startsWith("gid://") ? String(p) : `gid://shopify/Product/${p}`);
-
-// First attempt: use references (List<Product> field)
-let fields = [...fieldsBase];
-if (productGids.length) fields.push({ key: "products", references: productGids });
-
-const mutation = `
-  mutation CreateAppointment($metaobject: MetaobjectCreateInput!) {
-    metaobjectCreate(metaobject: $metaobject) {
-      metaobject { id }
-      userErrors { field message code }
+    if (!token) {
+      return res.status(403).json({
+        ok: false,
+        error: 'No access token',
+        installUrl: `${HOST}/auth?shop=${shop}`
+      });
     }
-  }`;
 
-let variables = { metaobject: { type: "appointment", fields } };
-let create = await adminFetch(shop, accessToken, mutation, variables);
-let userErrors = create.json?.data?.metaobjectCreate?.userErrors || [];
+    // Validation
+    const errors = {};
+    if (!name?.trim()) errors.name = 'Name required';
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email || '')) errors.email = 'Valid email required';
+    if (!phone?.trim()) errors.phone = 'Phone required';
+    if (!date) errors.date = 'Date required';
+    if (!time) errors.time = 'Time required';
 
-// Fallback: if references are rejected, store IDs as text JSON
-if (userErrors.length && productGids.length) {
-  const looksLikeRefError = userErrors.some(e => (e.field || []).join('.').includes('products') || /reference/i.test(e.message));
-  if (looksLikeRefError) {
-    fields = [...fieldsBase, { key: "products", value: JSON.stringify(productGids) }];
-    variables = { metaobject: { type: "appointment", fields } };
-    create = await adminFetch(shop, accessToken, mutation, variables);
-    userErrors = create.json?.data?.metaobjectCreate?.userErrors || [];
+    if (Object.keys(errors).length) {
+      return res.status(400).json({ ok: false, errors });
+    }
+
+    // Build datetime
+    const datetime = new Date(`${date}T${time}:00Z`).toISOString();
+
+    // Build fields
+    const fields = [
+      { key: 'customer_name', value: name.trim() },
+      { key: 'email', value: email.trim() },
+      { key: 'contact_number', value: phone.trim() },
+      { key: 'datetime', value: datetime },
+      { key: 'notes', value: notes?.trim() || '' },
+      { key: 'status', value: 'new' }
+    ];
+
+    // Add products if provided
+    const productGids = (Array.isArray(products) ? products : [])
+      .map(p => String(p).startsWith('gid://') ? String(p) : `gid://shopify/Product/${p}`);
+
+    if (productGids.length) {
+      fields.push({ key: 'products', references: productGids });
+    }
+
+    // Create metaobject
+    const mutation = `
+      mutation CreateAppointment($metaobject: MetaobjectCreateInput!) {
+        metaobjectCreate(metaobject: $metaobject) {
+          metaobject { id }
+          userErrors { field message }
+        }
+      }`;
+
+    const variables = { metaobject: { type: 'appointment', fields } };
+    const apiUrl = `https://${shop}/admin/api/${API_VERSION}/graphql.json`;
+
+    const response = await fetch(apiUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Shopify-Access-Token': token
+      },
+      body: JSON.stringify({ query: mutation, variables })
+    });
+
+    const data = await response.json();
+    const userErrors = data.data?.metaobjectCreate?.userErrors || [];
+
+    if (userErrors.length) {
+      console.error('Metaobject creation errors:', userErrors);
+      return res.status(500).json({ ok: false, error: userErrors });
+    }
+
+    res.json({ ok: true });
+
+  } catch (error) {
+    console.error('Appointment creation error:', error);
+    res.status(500).json({ ok: false, error: 'Server error' });
   }
-}
+});
 
-if (userErrors.length) {
-  return res.status(500).json({ ok: false, error: userErrors });
-}
-return res.json({ ok: true });
-  } catch (err) {
-    console.error("create error", err);
-    return res.status(500).json({ ok: false, error: "Server error" });
-  }
+// Health check
+app.get('/', (req, res) => {
+  res.send('Shopify Appointments Server is running');
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`🚀 Server listening on port ${PORT}`);
+  console.log(`📍 OAuth URL: ${HOST}/auth?shop=YOUR_STORE.myshopify.com`);
+});
