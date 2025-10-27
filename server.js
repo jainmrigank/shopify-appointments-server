@@ -297,7 +297,7 @@ app.post('/appointments', async (req, res) => {
       const isList = productGids.length > 1; // or make this true if your definition is list.*
       fields.push({
         key: 'products',
-        value: isList ? JSON.stringify(productGids) : productGids[0]
+        value: JSON.stringify(productGids)
       });
     }
 
