@@ -251,10 +251,10 @@ app.post("/appointments", async (req, res) => {
     if (isTaken) return res.status(409).json({ ok: false, errors: { time: "This time slot is already booked" } });
 
     // Convert product ids to GIDs
-    const productGids = (Array.isArray(products) ? products : []).map(p => {
+    /* const productGids = (Array.isArray(products) ? products : []).map(p => {
       const s = String(p);
       return s.startsWith("gid://") ? s : `gid://shopify/Product/${s}`;
-    });
+    }); */
 
     // Build fields for the "appointment" metaobject definition
 const fieldsBase = [
