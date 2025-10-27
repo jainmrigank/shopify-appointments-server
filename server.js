@@ -64,30 +64,34 @@ function verifyHmac(query, secret) {
 // ---- state ----
 const STATE_MAP = new Map();
 
-// ---- CORS ----
-const allowList = ALLOWED_ORIGINS.split(",").map(s => s.trim()).filter(Boolean);
+// CORS
+const allowList = (process.env.ALLOWED_ORIGINS || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
+
 const isAllowedOrigin = (origin) => {
   if (!origin) return true;
   try {
     const u = new URL(origin);
-    return (
-      allowList.includes(origin) ||
-      u.hostname.endsWith(".myshopify.com")
-    );
-  } catch {
-    return false;
-  }
+    return allowList.includes(origin) || u.hostname.endsWith('.myshopify.com');
+  } catch { return false; }
 };
 
-app.use(cors({
-  origin: (origin, cb) => {
-    if (isAllowedOrigin(origin)) return cb(null, true);
-    return cb(new Error("CORS not allowed"));
-  },
-  methods: ["GET","POST","OPTIONS"],
-  allowedHeaders: ["Content-Type","Authorization","X-Shopify-Shop-Domain"],
-  credentials: false
-}));
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (isAllowedOrigin(origin)) {
+    res.header('Access-Control-Allow-Origin', origin || '*');
+    res.header('Vary', 'Origin');
+    res.header('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+    // Allow the headers your browser is sending (include cache-control to satisfy preflight)
+    res.header('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-Shopify-Shop-Domain,Cache-Control');
+    // Optional: expose any custom headers you return
+    res.header('Access-Control-Expose-Headers', 'Content-Type');
+  }
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
 
 // ---- ROUTES ----
 
