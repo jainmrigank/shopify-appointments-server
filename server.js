@@ -290,8 +290,16 @@ app.post('/appointments', async (req, res) => {
     ];
 
     const productGids = (Array.isArray(products) ? products : [])
-      .map(p => (String(p).startsWith('gid://') ? String(p) : `gid://shopify/Product/${p}`));
-    if (productGids.length) fields.push({ key: 'products', references: productGids });
++      .map(p => (String(p).startsWith('gid://') ? String(p) : `gid://shopify/Product/${p}`));
++    if (productGids.length) {
++      // For a list.product_reference field, value must be a JSON array string of GIDs.
++      // For a single product_reference field, value is one GID string.
++      const isList = productGids.length > 1; // or make this true if your definition is list.*
++      fields.push({
++        key: 'products',
++        value: isList ? JSON.stringify(productGids) : productGids[0]
++      });
++    }
 
     const mutation = `
       mutation CreateAppointment($metaobject: MetaobjectCreateInput!) {
@@ -313,10 +321,16 @@ app.post('/appointments', async (req, res) => {
     });
     const data = await resp.json();
     const userErrors = data?.data?.metaobjectCreate?.userErrors || [];
-    if (userErrors.length) {
-      console.error('Metaobject creation errors:', userErrors);
-      return res.status(500).json({ ok: false, error: userErrors });
-    }
++    if (userErrors.length) {
++      console.error('Metaobject creation errors:', userErrors);
++      // Map to form-friendly shape and include raw details
++      const errors = {};
++      for (const e of userErrors) {
++        const path = Array.isArray(e.field) ? e.field.join('.') : 'products';
++        errors[path] = e.message;
++      }
++      return res.status(400).json({ ok: false, errors, raw: userErrors });
++    }
 
     res.json({ ok: true });
   } catch (err) {
