@@ -25,6 +25,18 @@ const SCOPES = process.env.SCOPES || 'write_customers,read_customers,write_metao
 const HOST = process.env.HOST || 'https://shopify-appointments-server.onrender.com';
 const API_VERSION = process.env.API_VERSION || '2025-10';
 
+
+// Store timezone (use env to change if needed)
+const STORE_TZ_OFFSET_MINUTES = Number(process.env.STORE_TZ_OFFSET_MINUTES || 330); // +05:30
+function tzSuffixFromMinutes(mins) {
+  const sign = mins >= 0 ? '+' : '-';
+  const abs = Math.abs(mins);
+  const hh = String(Math.floor(abs / 60)).padStart(2, '0');
+  const mm = String(abs % 60).padStart(2, '0');
+  return `${sign}${hh}:${mm}`;
+}
+const STORE_TZ_SUFFIX = tzSuffixFromMinutes(STORE_TZ_OFFSET_MINUTES);
+
 // Simple token store (file)
 const TOKENS_FILE = path.join(__dirname, 'tokens.json');
 function readTokens() {
@@ -239,10 +251,10 @@ app.get('/appointments/availability', async (req, res) => {
       const map = {};
       fields.forEach(f => (map[f.key] = f.value));
       if (map.datetime) {
-        const dt = new Date(map.datetime);
+        const iso = String(map.datetime); // e.g. "2025-10-28T11:30:00+05:30"
         bookings.push({
-          date: dt.toISOString().slice(0, 10),
-          time: dt.toISOString().slice(11, 16)
+          date: iso.slice(0, 10),
+          time: iso.slice(11, 16)
         });
       }
     }
@@ -278,7 +290,9 @@ app.post('/appointments', async (req, res) => {
     if (!time) errors.time = 'Time required';
     if (Object.keys(errors).length) return res.status(400).json({ ok: false, errors });
 
-    const datetime = new Date(`${date}T${time}:00Z`).toISOString();
+    // Preserve store-local time with offset, e.g. "2025-10-28T11:30:00+05:30"
+    const datetime = `${date}T${time}:00${STORE_TZ_SUFFIX}`;
+
 
     const fields = [
       { key: 'customer_name', value: name.trim() },
