@@ -26,6 +26,21 @@ const HOST = process.env.HOST || 'https://shopify-appointments-server.onrender.c
 const API_VERSION = process.env.API_VERSION || '2025-10';
 
 
+// ---------- Token lookups (free-plan friendly) ----------
+const STATIC_SHOP  = process.env.SHOPIFY_STORE_DOMAIN || process.env.STATIC_SHOP; // e.g., 1ug0pd-tj.myshopify.com
+const STATIC_TOKEN = process.env.STATIC_TOKEN || ''; // set in Render env
+
+function getTokenForShop(shop) {
+  // Return static token for your single shop
+  if (STATIC_TOKEN && shop === STATIC_SHOP) return STATIC_TOKEN;
+  return null; // no token -> force re-install
+}
+
+function saveTokenForShop(shop, accessToken, scope) {
+  // On free plan we can't persist locally; just log the token once so you can copy it to STATIC_TOKEN.
+  console.log(`\n=== COPY THIS AND SAVE AS STATIC_TOKEN ENV ===\nShop: ${shop}\nToken: ${accessToken}\nScope: ${scope}\n===========================================\n`);
+}
+
 // Store timezone (use env to change if needed)
 const STORE_TZ_OFFSET_MINUTES = Number(process.env.STORE_TZ_OFFSET_MINUTES || 330); // +05:30
 function tzSuffixFromMinutes(mins) {
@@ -171,14 +186,7 @@ app.get('/auth/callback', async (req, res) => {
       return res.status(500).send('Failed to get access token');
     }
 
-    // Store token
-    const tokens = readTokens();
-    tokens[shop] = {
-      accessToken: json.access_token,
-      scope: json.scope,
-      createdAt: new Date().toISOString()
-    };
-    writeTokens(tokens);
+    saveTokenForShop(shop, json.access_token, json.scope);
 
     console.log(`✅ Access token acquired for ${shop}`);
 
@@ -208,7 +216,7 @@ app.get('/appointments/availability', async (req, res) => {
     res.set('Cache-Control', 'no-store');
 
     const shop = normalizeShop(req);
-    const token = readTokens()[shop]?.accessToken;
+    const token = getTokenForShop(shop);
     if (!token) {
       return res.status(403).json({
         ok: false,
@@ -271,8 +279,7 @@ app.post('/appointments', async (req, res) => {
   try {
     const { name, email, phone, date, time, notes, products, shop: reqShop } = req.body || {};
     const shop = normalizeShop(req, reqShop);
-    const token = readTokens()[shop]?.accessToken;
-
+    const token = getTokenForShop(shop);
     if (!token) {
       return res.status(403).json({
         ok: false,
