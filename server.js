@@ -13,7 +13,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname  = path.dirname(__filename);
 
 const app = express();
-app.use(express.json({ limit: '25mb' })); // raised to handle multiple base64 images
+app.use(express.json({ limit: '25mb' }));
 app.use(cookieParser());
 
 // ── Env ──
@@ -30,7 +30,6 @@ function getTokenForShop(shop) {
   if (STATIC_TOKEN && shop === STATIC_SHOP) return STATIC_TOKEN;
   return null;
 }
-
 function saveTokenForShop(shop, accessToken, scope) {
   console.log(`\n=== COPY THIS AND SAVE AS STATIC_TOKEN ENV ===\nShop: ${shop}\nToken: ${accessToken}\nScope: ${scope}\n===========================================\n`);
 }
@@ -50,7 +49,6 @@ const isAllowed = origin => {
   try { const u = new URL(origin); return allowedOrigins.includes(origin) || u.hostname.endsWith('.myshopify.com'); }
   catch { return false; }
 };
-
 app.use((req, res, next) => {
   const origin = req.headers.origin;
   if (isAllowed(origin)) {
@@ -71,7 +69,6 @@ function verifyHmac(query, secret) {
   return crypto.createHmac('sha256', secret).update(message).digest('hex') === hmac;
 }
 function generateNonce() { return crypto.randomBytes(16).toString('hex'); }
-
 function normalizeShop(req, fallback = '') {
   return (req.query.shop || req.body?.shop || fallback || '').replace(/^https?:\/\//, '').replace(/\/$/, '');
 }
@@ -102,7 +99,6 @@ app.get('/auth/callback', async (req, res) => {
     const json = await resp.json();
     if (!resp.ok || !json.access_token) { console.error('Token exchange failed:', json); return res.status(500).send('Failed to get access token'); }
     saveTokenForShop(shop, json.access_token, json.scope);
-    console.log(`✅ Access token acquired for ${shop}`);
     res.send(`<html><body><h2>App installed successfully!</h2><script>setTimeout(()=>{window.location.href='https://${shop}/admin/apps';},1500);</script></body></html>`);
   } catch (err) { console.error('OAuth callback error:', err); res.status(500).send('OAuth error'); }
 });
@@ -116,15 +112,13 @@ app.get('/appointments/availability', async (req, res) => {
     const shop  = normalizeShop(req);
     const token = getTokenForShop(shop);
     if (!token) return res.status(403).json({ ok:false, error:'No access token.', installUrl:`${HOST.replace(/\/$/, '')}/auth?shop=${shop}` });
-
     const query = `{ metaobjects(first: 250, type: "appointment") { edges { node { fields { key value } } } } }`;
     const resp  = await fetch(`https://${shop}/admin/api/${API_VERSION}/graphql.json`, {
       method: 'POST', headers: { 'Content-Type':'application/json', 'X-Shopify-Access-Token':token },
       body: JSON.stringify({ query })
     });
     const data = await resp.json();
-    if (data.errors) { console.error('GraphQL errors:', data.errors); return res.status(500).json({ ok:false, error:'GraphQL query failed' }); }
-
+    if (data.errors) return res.status(500).json({ ok:false, error:'GraphQL query failed' });
     const bookings = [];
     for (const edge of (data?.data?.metaobjects?.edges || [])) {
       const map = {};
@@ -140,316 +134,278 @@ app.get('/products/all', async (req, res) => {
   try {
     const shop  = normalizeShop(req);
     const token = getTokenForShop(shop);
-    if (!token) return res.status(403).json({ ok:false, error:'No access token.', installUrl:`${HOST.replace(/\/$/, '')}/auth?shop=${shop}` });
-
+    if (!token) return res.status(403).json({ ok:false, error:'No access token.' });
     res.set('Cache-Control', 'public, max-age=60');
-
     const PAGE_SIZE = 250;
-    let products = [];
-    let cursor   = null;
-    let hasNext  = true;
-
+    let products = [], cursor = null, hasNext = true;
     while (hasNext) {
       const afterClause = cursor ? `, after: "${cursor}"` : '';
-      const query = `{
-        products(first: ${PAGE_SIZE}${afterClause}) {
-          pageInfo { hasNextPage endCursor }
-          edges {
-            node {
-              id title handle
-              featuredImage { url altText }
-            }
-          }
-        }
-      }`;
-
+      const query = `{ products(first: ${PAGE_SIZE}${afterClause}) { pageInfo { hasNextPage endCursor } edges { node { id title handle featuredImage { url altText } } } } }`;
       const resp = await fetch(`https://${shop}/admin/api/${API_VERSION}/graphql.json`, {
-        method: 'POST',
-        headers: { 'Content-Type':'application/json', 'X-Shopify-Access-Token':token },
+        method: 'POST', headers: { 'Content-Type':'application/json', 'X-Shopify-Access-Token':token },
         body: JSON.stringify({ query })
       });
       const data = await resp.json();
-      if (data.errors) { console.error('Products GraphQL errors:', data.errors); break; }
-
+      if (data.errors) break;
       const page = data?.data?.products;
       if (!page) break;
-
       for (const edge of (page.edges || [])) {
         const node = edge.node;
-        const numericId = node.id.replace('gid://shopify/Product/', '');
-        products.push({
-          id: numericId, title: node.title, handle: node.handle,
-          images: node.featuredImage ? [{ src: node.featuredImage.url }] : []
-        });
+        products.push({ id: node.id.replace('gid://shopify/Product/', ''), title: node.title, handle: node.handle, images: node.featuredImage ? [{ src: node.featuredImage.url }] : [] });
       }
-
       hasNext = page.pageInfo?.hasNextPage || false;
       cursor  = page.pageInfo?.endCursor   || null;
     }
-
     res.json({ ok: true, products });
-  } catch (err) {
-    console.error('Products list error:', err);
-    res.status(500).json({ ok:false, error:'Server error' });
-  }
+  } catch (err) { console.error('Products list error:', err); res.status(500).json({ ok:false, error:'Server error' }); }
 });
 
 // ══════════════════════════════════════════════════════════════
 // SHOPIFY FILES UPLOAD
-// Upload a base64 image to Shopify Files (CDN) and return its URL.
 //
-// Flow:
-//   1. stagedUploadsCreate  → Shopify returns a pre-signed S3 target + a resourceUrl
-//   2. PUT the binary to S3 → file is now on S3
-//   3. fileCreate           → tells Shopify to ingest the S3 file into the Files library
-//   4. Poll fileCreate result for the final CDN URL (Shopify processes async)
+// Returns { gid, url } for a successfully uploaded image, or null.
 //
-// This gives permanent cdn.shopify.com URLs safe to embed in emails.
+// The GID (e.g. "gid://shopify/MediaImage/123456") is what gets stored
+// in the metaobject's  reference_images  List·Image(File) field.
+// Shopify Flow then resolves it to an image URL via:
+//   metaobject.referenceImages | map: 'image' | map: 'url'
 // ══════════════════════════════════════════════════════════════
 
-/**
- * Parse a data URL into { mimeType, base64Data, extension }
- */
 function parseDataUrl(dataUrl) {
-  // data:[<mediatype>][;base64],<data>
   const match = dataUrl.match(/^data:([^;]+);base64,(.+)$/s);
   if (!match) return null;
-  const mimeType = match[1];
-  const base64Data = match[2];
-  const extMap = {
-    'image/jpeg': 'jpg', 'image/jpg': 'jpg', 'image/png': 'png',
-    'image/webp': 'webp', 'image/gif': 'gif', 'image/heic': 'heic'
-  };
-  const extension = extMap[mimeType] || 'jpg';
-  return { mimeType, base64Data, extension };
+  const mimeType   = match[1];
+  const base64Data = match[2].replace(/\s/g, '');
+  const extMap = { 'image/jpeg':'jpg','image/jpg':'jpg','image/png':'png','image/webp':'webp','image/gif':'gif','image/heic':'heic' };
+  return { mimeType, base64Data, extension: extMap[mimeType] || 'jpg' };
 }
 
 /**
- * Upload one reference image to Shopify Files.
- * Returns the CDN URL string, or null on failure.
+ * Upload one image (base64 data URL) to Shopify Files.
+ * Returns { gid, url } on success, null on failure.
+ *   gid  – "gid://shopify/MediaImage/…"  → stored in reference_images field
+ *   url  – cdn.shopify.com URL            → put in notes for human readability
  */
-async function uploadReferenceImageToShopify(shop, token, imageObj) {
+async function uploadImageToShopifyFiles(shop, token, imageObj) {
   try {
     const { filename, data } = imageObj;
-    if (!data || !data.startsWith('data:')) return null;
+    if (!data || !data.startsWith('data:')) {
+      console.error('uploadImage: missing data URL for', filename);
+      return null;
+    }
 
     const parsed = parseDataUrl(data);
-    if (!parsed) return null;
+    if (!parsed) { console.error('uploadImage: bad data URL for', filename); return null; }
 
     const { mimeType, base64Data, extension } = parsed;
-    const safeFilename = filename
-      ? filename.replace(/[^a-zA-Z0-9._-]/g, '_')
-      : `ref_${Date.now()}.${extension}`;
-
-    const fileSize = Math.ceil(base64Data.length * 0.75); // approximate byte size
-    const graphqlUrl = `https://${shop}/admin/api/${API_VERSION}/graphql.json`;
-    const headers = { 'Content-Type': 'application/json', 'X-Shopify-Access-Token': token };
-
-    // ── Step 1: Request a staged upload target from Shopify ──
-    const stageResp = await fetch(graphqlUrl, {
-      method: 'POST', headers,
-      body: JSON.stringify({
-        query: `
-          mutation stagedUploadsCreate($input: [StagedUploadInput!]!) {
-            stagedUploadsCreate(input: $input) {
-              stagedTargets {
-                url
-                resourceUrl
-                parameters { name value }
-              }
-              userErrors { field message }
-            }
-          }`,
-        variables: {
-          input: [{
-            filename:   safeFilename,
-            mimeType,
-            resource:   'FILE',
-            fileSize:   String(fileSize),
-            httpMethod: 'PUT'
-          }]
-        }
-      })
-    });
-
-    const stageData = await stageResp.json();
-    if (stageData.errors) {
-      console.error('stagedUploadsCreate errors:', stageData.errors);
-      return null;
-    }
-    const userErrors = stageData?.data?.stagedUploadsCreate?.userErrors || [];
-    if (userErrors.length) { console.error('stagedUploads userErrors:', userErrors); return null; }
-
-    const target = stageData?.data?.stagedUploadsCreate?.stagedTargets?.[0];
-    if (!target) { console.error('No staged target returned'); return null; }
-
-    const { url: uploadUrl, resourceUrl, parameters } = target;
-
-    // ── Step 2: PUT binary to the pre-signed S3 URL ──
     const binaryBuffer = Buffer.from(base64Data, 'base64');
+    const exactByteSize = binaryBuffer.length;
+    const safeFilename  = (filename || `ref_${Date.now()}.${extension}`).replace(/[^a-zA-Z0-9._-]/g, '_');
 
-    // Build form fields if Shopify returned parameters (POST-style) — otherwise PUT directly
-    let uploadResp;
-    if (parameters && parameters.length > 0) {
-      // S3 multipart form POST
-      const { default: FormData } = await import('form-data');
-      const form = new FormData();
-      parameters.forEach(p => form.append(p.name, p.value));
-      form.append('file', binaryBuffer, { filename: safeFilename, contentType: mimeType });
-      uploadResp = await fetch(uploadUrl, { method: 'POST', body: form, headers: form.getHeaders() });
-    } else {
-      // Direct PUT (more common for FILE resource)
-      uploadResp = await fetch(uploadUrl, {
-        method: 'PUT',
-        headers: { 'Content-Type': mimeType, 'Content-Length': String(binaryBuffer.length) },
-        body: binaryBuffer
-      });
-    }
+    const graphqlUrl = `https://${shop}/admin/api/${API_VERSION}/graphql.json`;
+    const gqlHeaders = { 'Content-Type': 'application/json', 'X-Shopify-Access-Token': token };
 
-    if (!uploadResp.ok) {
-      const body = await uploadResp.text();
-      console.error(`S3 upload failed (${uploadResp.status}):`, body.slice(0, 300));
-      return null;
-    }
+    console.log(`📤 Staging: ${safeFilename} (${exactByteSize} bytes, ${mimeType})`);
 
-    // ── Step 3: Tell Shopify to ingest the file from S3 ──
-    const fileCreateResp = await fetch(graphqlUrl, {
-      method: 'POST', headers,
+    // ── Step 1: stagedUploadsCreate ──
+    const stageResp = await fetch(graphqlUrl, {
+      method: 'POST', headers: gqlHeaders,
       body: JSON.stringify({
-        query: `
-          mutation fileCreate($files: [FileCreateInput!]!) {
-            fileCreate(files: $files) {
-              files {
-                id
-                fileStatus
-                ... on MediaImage { image { url } }
-                ... on GenericFile { url }
-              }
-              userErrors { field message }
-            }
-          }`,
-        variables: {
-          files: [{
-            originalSource: resourceUrl,
-            filename:       safeFilename,
-            contentType:    'IMAGE',
-            alt:            safeFilename
-          }]
-        }
+        query: `mutation stagedUploadsCreate($input: [StagedUploadInput!]!) {
+          stagedUploadsCreate(input: $input) {
+            stagedTargets { url resourceUrl parameters { name value } }
+            userErrors { field message }
+          }
+        }`,
+        variables: { input: [{ filename: safeFilename, mimeType, resource: 'FILE', fileSize: String(exactByteSize), httpMethod: 'PUT' }] }
       })
     });
+    const stageJson = await stageResp.json();
+    if (stageJson.errors || stageJson?.data?.stagedUploadsCreate?.userErrors?.length) {
+      console.error('stagedUploadsCreate failed:', JSON.stringify(stageJson.errors || stageJson?.data?.stagedUploadsCreate?.userErrors));
+      return null;
+    }
+    const target = stageJson?.data?.stagedUploadsCreate?.stagedTargets?.[0];
+    if (!target) { console.error('No staged target'); return null; }
+    const { url: s3Url, resourceUrl } = target;
 
-    const fileCreateData = await fileCreateResp.json();
-    if (fileCreateData.errors) { console.error('fileCreate errors:', fileCreateData.errors); return null; }
-    const fcUserErrors = fileCreateData?.data?.fileCreate?.userErrors || [];
-    if (fcUserErrors.length) { console.error('fileCreate userErrors:', fcUserErrors); return null; }
+    // ── Step 2: PUT binary to S3 ──
+    const s3Resp = await fetch(s3Url, {
+      method: 'PUT',
+      headers: { 'Content-Type': mimeType, 'Content-Length': String(exactByteSize) },
+      body: binaryBuffer
+    });
+    if (!s3Resp.ok) {
+      console.error(`S3 PUT failed (${s3Resp.status}):`, (await s3Resp.text()).slice(0, 300));
+      return null;
+    }
+    console.log(`✅ S3 PUT OK (${s3Resp.status})`);
 
-    const createdFiles = fileCreateData?.data?.fileCreate?.files || [];
-    const fileId       = createdFiles[0]?.id;
+    // ── Step 3: fileCreate ──
+    const fcResp = await fetch(graphqlUrl, {
+      method: 'POST', headers: gqlHeaders,
+      body: JSON.stringify({
+        query: `mutation fileCreate($files: [FileCreateInput!]!) {
+          fileCreate(files: $files) {
+            files {
+              id fileStatus
+              ... on MediaImage { image { url } }
+              ... on GenericFile  { url }
+            }
+            userErrors { field message }
+          }
+        }`,
+        variables: { files: [{ originalSource: resourceUrl, filename: safeFilename, contentType: 'IMAGE', alt: safeFilename }] }
+      })
+    });
+    const fcJson = await fcResp.json();
+    if (fcJson.errors || fcJson?.data?.fileCreate?.userErrors?.length) {
+      console.error('fileCreate failed:', JSON.stringify(fcJson.errors || fcJson?.data?.fileCreate?.userErrors));
+      return null;
+    }
+    const createdFile = fcJson?.data?.fileCreate?.files?.[0];
+    if (!createdFile) { console.error('fileCreate returned no file'); return null; }
 
-    // ── Step 4: Poll until Shopify has finished processing the file ──
-    // Shopify processes files asynchronously; status moves UPLOADED → READY
-    if (fileId) {
-      const cdnUrl = await pollFileReady(graphqlUrl, headers, fileId);
-      if (cdnUrl) { console.log(`✅ Image uploaded: ${cdnUrl}`); return cdnUrl; }
+    const fileGid = createdFile.id;
+    console.log(`📋 File GID: ${fileGid}  status: ${createdFile.fileStatus}`);
+
+    // If immediately READY, return both gid and url now
+    if (createdFile.fileStatus === 'READY') {
+      const url = createdFile.image?.url || createdFile.url || null;
+      if (url) { console.log(`✅ Immediately READY: ${url}`); return { gid: fileGid, url }; }
     }
 
-    // Fallback: return the resourceUrl (S3 pre-signed, will eventually redirect to CDN)
-    console.warn('File poll timed out, returning resourceUrl as fallback');
-    return resourceUrl || null;
+    // ── Step 4: Poll for READY ──
+    const result = await pollFileReady(graphqlUrl, gqlHeaders, fileGid, 15, 1200);
+    if (result) { console.log(`✅ READY after poll: ${result.url}`); return { gid: fileGid, url: result.url }; }
+
+    // Timeout fallback — return gid without url; Flow can still resolve the image
+    console.warn(`⚠️  Poll timed out for ${safeFilename}. Returning GID without confirmed URL.`);
+    return { gid: fileGid, url: resourceUrl };
 
   } catch (err) {
-    console.error('uploadReferenceImageToShopify error:', err);
+    console.error('uploadImageToShopifyFiles error:', err);
+    return null;
+  }
+}
+
+async function pollFileReady(graphqlUrl, headers, fileId, maxAttempts = 15, delayMs = 1200) {
+  for (let i = 0; i < maxAttempts; i++) {
+    await new Promise(r => setTimeout(r, delayMs));
+    try {
+      const resp = await fetch(graphqlUrl, {
+        method: 'POST', headers,
+        body: JSON.stringify({
+          query: `{ node(id: "${fileId}") {
+            ... on MediaImage { fileStatus image { url } }
+            ... on GenericFile  { fileStatus url }
+          }}`
+        })
+      });
+      const data = await resp.json();
+      const node = data?.data?.node;
+      if (!node) continue;
+      console.log(`  poll ${i+1}: ${node.fileStatus}`);
+      if (node.fileStatus === 'READY')  return { url: node.image?.url || node.url };
+      if (node.fileStatus === 'FAILED') { console.error('File FAILED:', fileId); return null; }
+    } catch (e) { console.warn(`poll error attempt ${i+1}:`, e.message); }
+  }
+  return null;
+}
+
+/**
+ * Given a product image URL (already a CDN URL from Shopify), upload it to the
+ * Files library so we can get a proper MediaImage GID for the metaobject field.
+ * Returns { gid, url } or null.
+ */
+async function uploadProductImageToShopifyFiles(shop, token, productImageUrl, productTitle) {
+  try {
+    if (!productImageUrl) return null;
+
+    const graphqlUrl = `https://${shop}/admin/api/${API_VERSION}/graphql.json`;
+    const gqlHeaders = { 'Content-Type': 'application/json', 'X-Shopify-Access-Token': token };
+
+    // Product images already live on Shopify CDN — we can use fileCreate with
+    // originalSource directly (no S3 staging needed for external URLs).
+    const safeFilename = `product_${productTitle.replace(/[^a-zA-Z0-9._-]/g,'_').slice(0,60)}_${Date.now()}.jpg`;
+
+    console.log(`📤 Registering product image in Files: ${safeFilename}`);
+
+    const fcResp = await fetch(graphqlUrl, {
+      method: 'POST', headers: gqlHeaders,
+      body: JSON.stringify({
+        query: `mutation fileCreate($files: [FileCreateInput!]!) {
+          fileCreate(files: $files) {
+            files {
+              id fileStatus
+              ... on MediaImage { image { url } }
+              ... on GenericFile  { url }
+            }
+            userErrors { field message }
+          }
+        }`,
+        variables: { files: [{ originalSource: productImageUrl, filename: safeFilename, contentType: 'IMAGE', alt: productTitle }] }
+      })
+    });
+    const fcJson = await fcResp.json();
+    if (fcJson.errors || fcJson?.data?.fileCreate?.userErrors?.length) {
+      console.error('Product image fileCreate failed:', JSON.stringify(fcJson.errors || fcJson?.data?.fileCreate?.userErrors));
+      return null;
+    }
+    const createdFile = fcJson?.data?.fileCreate?.files?.[0];
+    if (!createdFile) return null;
+
+    const fileGid = createdFile.id;
+    if (createdFile.fileStatus === 'READY') {
+      const url = createdFile.image?.url || createdFile.url || productImageUrl;
+      return { gid: fileGid, url };
+    }
+
+    const result = await pollFileReady(graphqlUrl, gqlHeaders, fileGid, 15, 1200);
+    return result ? { gid: fileGid, url: result.url } : { gid: fileGid, url: productImageUrl };
+
+  } catch (err) {
+    console.error('uploadProductImageToShopifyFiles error:', err);
     return null;
   }
 }
 
 /**
- * Poll the file status until READY, then return the CDN URL.
- * Times out after ~10 s (10 attempts × 1 s delay).
+ * Fetch product details (title + featured image URL) for a list of product GIDs.
+ * Returns Map<numericId, { title, imageUrl }>
  */
-async function pollFileReady(graphqlUrl, headers, fileId, maxAttempts = 10, delayMs = 1000) {
-  for (let i = 0; i < maxAttempts; i++) {
-    await new Promise(r => setTimeout(r, delayMs));
+async function fetchProductDetails(shop, token, productIds) {
+  if (!productIds.length) return new Map();
+  try {
+    const graphqlUrl = `https://${shop}/admin/api/${API_VERSION}/graphql.json`;
+    const gids = productIds.map(id => String(id).startsWith('gid://') ? String(id) : `gid://shopify/Product/${id}`);
+
+    const query = `{
+      nodes(ids: ${JSON.stringify(gids)}) {
+        ... on Product {
+          id title
+          featuredImage { url }
+        }
+      }
+    }`;
 
     const resp = await fetch(graphqlUrl, {
-      method: 'POST', headers,
-      body: JSON.stringify({
-        query: `{
-          node(id: "${fileId}") {
-            ... on MediaImage {
-              fileStatus
-              image { url }
-            }
-            ... on GenericFile {
-              fileStatus
-              url
-            }
-          }
-        }`
-      })
+      method: 'POST',
+      headers: { 'Content-Type':'application/json', 'X-Shopify-Access-Token': token },
+      body: JSON.stringify({ query })
     });
-
     const data = await resp.json();
-    const node = data?.data?.node;
-    if (!node) continue;
-
-    if (node.fileStatus === 'READY') {
-      return node.image?.url || node.url || null;
+    const result = new Map();
+    for (const node of (data?.data?.nodes || [])) {
+      if (!node?.id) continue;
+      const numericId = node.id.replace('gid://shopify/Product/', '');
+      result.set(numericId, { title: node.title, imageUrl: node.featuredImage?.url || null });
     }
-    if (node.fileStatus === 'FAILED') {
-      console.error('Shopify file processing FAILED for', fileId);
-      return null;
-    }
-    // UPLOADED or PROCESSING — keep polling
+    return result;
+  } catch (err) {
+    console.error('fetchProductDetails error:', err);
+    return new Map();
   }
-  return null; // timed out
-}
-
-/**
- * Upload all reference images in parallel (max 5 concurrent).
- * Returns an array of { filename, url } for images that succeeded,
- * and { filename, url: null } for any that failed.
- */
-async function uploadAllReferenceImages(shop, token, referenceImages) {
-  if (!Array.isArray(referenceImages) || referenceImages.length === 0) return [];
-
-  // Limit concurrency to 5 to avoid hammering the API
-  const CONCURRENCY = 5;
-  const results = [];
-
-  for (let i = 0; i < referenceImages.length; i += CONCURRENCY) {
-    const batch = referenceImages.slice(i, i + CONCURRENCY);
-    const batchResults = await Promise.all(
-      batch.map(async imgObj => {
-        const url = await uploadReferenceImageToShopify(shop, token, imgObj);
-        return { filename: imgObj.filename || 'image', url };
-      })
-    );
-    results.push(...batchResults);
-  }
-
-  return results;
-}
-
-// ── Build notes field ──
-// If images were uploaded successfully we store their CDN URLs.
-// If upload failed for some images we still note the filename.
-function buildNotesField(notes, uploadedImages) {
-  const uploaded = uploadedImages.filter(i => i.url);
-  const failed   = uploadedImages.filter(i => !i.url);
-  const parts    = [];
-
-  if (uploaded.length) {
-    const lines = uploaded.map(i => `${i.filename}: ${i.url}`).join('\n');
-    parts.push(`[Reference images (${uploaded.length}):\n${lines}]`);
-  }
-  if (failed.length) {
-    parts.push(`[Images that could not be uploaded: ${failed.map(i => i.filename).join(', ')}]`);
-  }
-
-  const base = (notes || '').trim();
-  return parts.length ? (base ? `${base}\n\n${parts.join('\n')}` : parts.join('\n')) : base;
 }
 
 // ── POST /appointments ──
@@ -458,7 +414,7 @@ app.post('/appointments', async (req, res) => {
     const { name, email, phone, date, time, notes, products, reference_images, shop: reqShop } = req.body || {};
     const shop  = normalizeShop(req, reqShop);
     const token = getTokenForShop(shop);
-    if (!token) return res.status(403).json({ ok:false, error:'No access token', installUrl:`${HOST.replace(/\/$/, '')}/auth?shop=${shop}` });
+    if (!token) return res.status(403).json({ ok:false, error:'No access token' });
 
     const errors = {};
     if (!name?.trim())  errors.name  = 'Name required';
@@ -470,43 +426,90 @@ app.post('/appointments', async (req, res) => {
 
     const datetime = `${date}T${time}:00${STORE_TZ_SUFFIX}`;
 
-    // ── Upload reference images to Shopify Files BEFORE creating the metaobject ──
-    const imgCount = Array.isArray(reference_images) ? reference_images.length : 0;
-    let uploadedImages = [];
+    // ══════════════════════════════════════════════════════════
+    // Build the reference_images field — ALL visuals in one list
+    //
+    // Order: uploaded reference images first, then product images
+    // Each item becomes a file GID stored in the List·Image(File) field.
+    // Shopify Flow accesses image URLs via:
+    //   metaobject.referenceImages | map: 'image' | map: 'url'
+    // ══════════════════════════════════════════════════════════
 
-    if (imgCount > 0) {
-      console.log(`📎 Uploading ${imgCount} reference image(s) for ${email}...`);
-      uploadedImages = await uploadAllReferenceImages(shop, token, reference_images);
-      const successCount = uploadedImages.filter(i => i.url).length;
-      console.log(`✅ ${successCount}/${imgCount} images uploaded successfully`);
+    const fileGids = [];   // GIDs for the metaobject field
+    const uploadLog = []; // human-readable notes log
+
+    // ── 1. Upload customer reference images (base64) ──
+    const refImages = Array.isArray(reference_images) ? reference_images : [];
+    if (refImages.length > 0) {
+      console.log(`\n📎 Uploading ${refImages.length} customer reference image(s) for ${email}`);
+      for (const imgObj of refImages) {
+        const result = await uploadImageToShopifyFiles(shop, token, imgObj);
+        if (result?.gid) {
+          fileGids.push(result.gid);
+          uploadLog.push(`Ref: ${imgObj.filename || 'image'} → ${result.url}`);
+          console.log(`  ✅ ${imgObj.filename} → GID: ${result.gid}`);
+        } else {
+          uploadLog.push(`Ref: ${imgObj.filename || 'image'} → upload failed`);
+          console.warn(`  ⚠️  Failed to upload ${imgObj.filename}`);
+        }
+      }
     }
 
-    // Build the notes field — now contains CDN URLs instead of just filenames
-    const finalNotes = buildNotesField(notes, uploadedImages);
+    // ── 2. Upload product featured images from product IDs ──
+    const productIds = Array.isArray(products) ? products : [];
+    if (productIds.length > 0) {
+      console.log(`\n🛍  Fetching + uploading ${productIds.length} product image(s)`);
+      const productDetails = await fetchProductDetails(shop, token, productIds);
 
-    // ── Build metaobject fields ──
+      for (const [numericId, details] of productDetails) {
+        if (!details.imageUrl) { console.warn(`  ⚠️  No image for product ${numericId}`); continue; }
+        const result = await uploadProductImageToShopifyFiles(shop, token, details.imageUrl, details.title);
+        if (result?.gid) {
+          fileGids.push(result.gid);
+          uploadLog.push(`Product: ${details.title} → ${result.url}`);
+          console.log(`  ✅ ${details.title} → GID: ${result.gid}`);
+        } else {
+          console.warn(`  ⚠️  Failed to upload image for ${details.title}`);
+        }
+      }
+    }
+
+    console.log(`\n📋 Total file GIDs collected: ${fileGids.length}`);
+
+    // ── Build the notes field (human-readable log) ──
+    const notesBase = (notes || '').trim();
+    const notesLog  = uploadLog.length
+      ? `[Reference images (${fileGids.length}):\n${uploadLog.join('\n')}]`
+      : '';
+    const finalNotes = notesBase && notesLog ? `${notesBase}\n\n${notesLog}` : (notesBase || notesLog);
+
+    // ── Build product GIDs for the products field (unchanged) ──
+    const productGids = productIds.map(p => String(p).startsWith('gid://') ? String(p) : `gid://shopify/Product/${p}`);
+
+    // ── Metaobject fields ──
+    // reference_images: List·Image(File) — stores file GIDs
+    // Each GID is a JSON-encoded string in the array (Shopify metaobject list format)
     const fields = [
-      { key:'customer_name',   value: name.trim() },
-      { key:'email',           value: email.trim() },
-      { key:'contact_number',  value: phone.trim() },
-      { key:'datetime',        value: datetime },
-      { key:'notes',           value: finalNotes },
-      { key:'status',          value: 'new' }
+      { key: 'customer_name',  value: name.trim() },
+      { key: 'email',          value: email.trim() },
+      { key: 'contact_number', value: phone.trim() },
+      { key: 'datetime',       value: datetime },
+      { key: 'notes',          value: finalNotes },
+      { key: 'status',         value: 'new' }
     ];
 
-    // Store uploaded image CDN URLs in a dedicated field (JSON array of URL strings)
-    // Your Shopify metaobject definition needs a field with key "reference_image_urls"
-    // of type "json" (or "list.url"). If you don't have that field yet, the userErrors
-    // from Shopify will tell you — you can safely remove these two lines until you add it.
-    const uploadedUrls = uploadedImages.filter(i => i.url).map(i => i.url);
-    if (uploadedUrls.length > 0) {
-      fields.push({ key: 'reference_image_urls', value: JSON.stringify(uploadedUrls) });
+    // reference_images field — value is a JSON array of GID strings
+    // This is how Shopify stores List type fields in metaobjects
+    if (fileGids.length > 0) {
+      fields.push({ key: 'reference_images', value: JSON.stringify(fileGids) });
     }
 
-    const productGids = (Array.isArray(products) ? products : [])
-      .map(p => String(p).startsWith('gid://') ? String(p) : `gid://shopify/Product/${p}`);
-    if (productGids.length) fields.push({ key:'products', value: JSON.stringify(productGids) });
+    // products field — unchanged, still stores product GIDs
+    if (productGids.length > 0) {
+      fields.push({ key: 'products', value: JSON.stringify(productGids) });
+    }
 
+    // ── Create metaobject ──
     const mutation = `
       mutation CreateAppointment($metaobject: MetaobjectCreateInput!) {
         metaobjectCreate(metaobject: $metaobject) {
@@ -515,50 +518,46 @@ app.post('/appointments', async (req, res) => {
         }
       }`;
 
-    const resp = await fetch(`https://${shop}/admin/api/${API_VERSION}/graphql.json`, {
-      method: 'POST',
-      headers: { 'Content-Type':'application/json', 'X-Shopify-Access-Token':token },
-      body: JSON.stringify({ query: mutation, variables: { metaobject: { type:'appointment', fields } } })
-    });
-    const data = await resp.json();
-    const userErrors = data?.data?.metaobjectCreate?.userErrors || [];
+    const createFn = async (fieldList) => {
+      const r = await fetch(`https://${shop}/admin/api/${API_VERSION}/graphql.json`, {
+        method: 'POST',
+        headers: { 'Content-Type':'application/json', 'X-Shopify-Access-Token':token },
+        body: JSON.stringify({ query: mutation, variables: { metaobject: { type:'appointment', fields: fieldList } } })
+      });
+      return r.json();
+    };
+
+    let data = await createFn(fields);
+    let userErrors = data?.data?.metaobjectCreate?.userErrors || [];
+
+    // Graceful retry: strip any fields Shopify doesn't recognise and retry once
+    if (userErrors.length) {
+      const badFields = userErrors
+        .filter(e => e.message?.toLowerCase().includes('unknown') || e.message?.toLowerCase().includes('invalid field'))
+        .map(e => (Array.isArray(e.field) ? e.field[e.field.length - 1] : e.field))
+        .filter(Boolean);
+
+      if (badFields.length && badFields.length === userErrors.length) {
+        console.warn(`⚠️  Retrying without unrecognised fields: ${badFields.join(', ')}`);
+        data = await createFn(fields.filter(f => !badFields.includes(f.key)));
+        userErrors = data?.data?.metaobjectCreate?.userErrors || [];
+      }
+    }
 
     if (userErrors.length) {
-      // If the only error is about the reference_image_urls field not existing yet,
-      // retry without that field so the appointment still gets created.
-      const isOnlyUnknownField = userErrors.every(e =>
-        Array.isArray(e.field) && e.field.includes('reference_image_urls')
-      );
-
-      if (isOnlyUnknownField) {
-        console.warn('reference_image_urls field not yet in metaobject definition — retrying without it.');
-        const fieldsWithoutUrls = fields.filter(f => f.key !== 'reference_image_urls');
-        const retry = await fetch(`https://${shop}/admin/api/${API_VERSION}/graphql.json`, {
-          method: 'POST',
-          headers: { 'Content-Type':'application/json', 'X-Shopify-Access-Token':token },
-          body: JSON.stringify({ query: mutation, variables: { metaobject: { type:'appointment', fields: fieldsWithoutUrls } } })
-        });
-        const retryData = await retry.json();
-        const retryErrors = retryData?.data?.metaobjectCreate?.userErrors || [];
-        if (retryErrors.length) {
-          console.error('Metaobject creation errors (retry):', retryErrors);
-          const errMap = {};
-          retryErrors.forEach(e => { errMap[Array.isArray(e.field) ? e.field.join('.') : 'general'] = e.message; });
-          return res.status(400).json({ ok:false, errors:errMap, raw:retryErrors });
-        }
-        // Succeeded on retry — return uploaded URLs so the client has them if needed
-        return res.json({ ok:true, reference_image_urls: uploadedUrls });
-      }
-
-      console.error('Metaobject creation errors:', userErrors);
+      console.error('Metaobject creation errors:', JSON.stringify(userErrors));
       const errMap = {};
       userErrors.forEach(e => { errMap[Array.isArray(e.field) ? e.field.join('.') : 'general'] = e.message; });
       return res.status(400).json({ ok:false, errors:errMap, raw:userErrors });
     }
 
-    res.json({ ok:true, reference_image_urls: uploadedUrls });
+    console.log(`✅ Appointment created for ${email} with ${fileGids.length} reference image(s)`);
+    res.json({ ok: true, reference_image_count: fileGids.length });
 
-  } catch (err) { console.error('Create appointment error:', err); res.status(500).json({ ok:false, error:'Server error' }); }
+  } catch (err) {
+    console.error('Create appointment error:', err);
+    res.status(500).json({ ok:false, error:'Server error' });
+  }
 });
 
 // Health
