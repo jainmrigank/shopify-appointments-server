@@ -572,5 +572,5 @@ app.get('/', (_req, res) => res.send('Shopify Appointments Server is running'));
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 Server listening on port ${PORT}`);
-  console.log(`📍 OAuth URL: ${HOST.replace(/\/$/, '')}/auth?shop=YOUR_STORE.myshopify.com`);
+  console.log(`📍 OAuth URL: ${HOST.replace(/\/$/, '')}/auth?shop=1ug0pd-tj.myshopify.com`);
 });
