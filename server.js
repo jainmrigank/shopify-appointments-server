@@ -402,12 +402,11 @@ app.post('/appointments', async (req, res) => {
 
     console.log(`Upload complete in ${Date.now() - startTime}ms. GIDs: ${fileGids.length}, Products: ${productDetails.size}`);
 
-    // Build notes
-    const notesBase = (notes || '').trim();
-    const notesLog  = uploadLog.length > 0
-      ? `[Images (${fileGids.length} ref uploads, ${productDetails.size} products):\n${uploadLog.join('\n')}]`
-      : '';
-    const finalNotes = [notesBase, notesLog].filter(Boolean).join('\n\n');
+    // Keep upload diagnostics in server logs, not in the customer-written notes field.
+    if (uploadLog.length > 0) {
+      console.log(`Upload summary:\n${uploadLog.join('\n')}`);
+    }
+    const finalNotes = (notes || '').trim();
 
     // Build product GIDs for the products field
     const productGids = productIds.map(p => String(p).startsWith('gid://') ? String(p) : `gid://shopify/Product/${p}`);
