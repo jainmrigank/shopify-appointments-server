@@ -44,6 +44,11 @@ function tzSuffixFromMinutes(mins) {
   return `${sign}${String(Math.floor(abs/60)).padStart(2,'0')}:${String(abs%60).padStart(2,'0')}`;
 }
 const STORE_TZ_SUFFIX = tzSuffixFromMinutes(STORE_TZ_OFFSET_MINUTES);
+const BOOKING_FORM_VERSION = 'booking-mode-v1';
+const CONSULTATION_LABELS = {
+  studio: 'Visit our Gurgaon studio',
+  online: 'Online consultation (video call or WhatsApp)'
+};
 
 // ── CORS ──
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
@@ -322,17 +327,35 @@ async function fetchProductDetails(shop, token, productIds) {
 app.post('/appointments', async (req, res) => {
   const startTime = Date.now();
   try {
-    const { name, email, phone, date, time, notes, products, reference_images, shop: reqShop } = req.body || {};
+    const {
+      name,
+      email,
+      phone,
+      date,
+      time,
+      notes,
+      products,
+      reference_images,
+      consultation_type,
+      form_version,
+      shop: reqShop
+    } = req.body || {};
     const shop  = normalizeShop(req, reqShop);
     const token = getTokenForShop(shop);
     if (!token) return res.status(403).json({ ok:false, error:'No access token' });
 
     const errors = {};
+    const consultationLabel = CONSULTATION_LABELS[consultation_type];
     if (!name?.trim())  errors.name  = 'Name required';
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email || '')) errors.email = 'Valid email required';
     if (!phone?.trim()) errors.phone = 'Phone required';
     if (!date)          errors.date  = 'Date required';
     if (!time)          errors.time  = 'Time required';
+    if (form_version === BOOKING_FORM_VERSION && !consultationLabel) {
+      errors.consultation_type = 'Choose how you would like to meet';
+    } else if (consultation_type && !consultationLabel) {
+      errors.consultation_type = 'Invalid consultation type';
+    }
     if (Object.keys(errors).length) return res.status(400).json({ ok:false, errors });
 
     const datetime = `${date}T${time}:00${STORE_TZ_SUFFIX}`;
@@ -399,6 +422,10 @@ app.post('/appointments', async (req, res) => {
       { key: 'status',         value: 'new' }
     ];
 
+    if (consultationLabel) {
+      fields.push({ key: 'consultation_type', value: consultationLabel });
+    }
+
     // reference_images: List·Image(File) — GIDs for customer-uploaded images only
     if (fileGids.length > 0) {
       fields.push({ key: 'reference_images', value: JSON.stringify(fileGids) });
@@ -452,7 +479,12 @@ app.post('/appointments', async (req, res) => {
 
     const totalMs = Date.now() - startTime;
     console.log(`✅ Appointment created in ${totalMs}ms`);
-    res.json({ ok: true, reference_image_count: fileGids.length, product_count: productDetails.size });
+    res.json({
+      ok: true,
+      consultation_type: consultation_type || null,
+      reference_image_count: fileGids.length,
+      product_count: productDetails.size
+    });
 
   } catch (err) {
     console.error('Create appointment error:', err);
